@@ -21,19 +21,16 @@ from django.views.decorators.csrf import csrf_exempt
 from django.template import TemplateDoesNotExist
 from django.http import HttpResponseRedirect
 from django.utils.http import is_safe_url
+from django.core.exceptions import ImproperlyConfigured
 
 from rest_auth.utils import jwt_encode
 
 
 # default User or custom User. Now both will work.
+
+
 User = get_user_model()
 
-try:
-    import urllib2 as _urllib
-except:
-    import urllib.request as _urllib
-    import urllib.error
-    import urllib.parse
 
 if parse_version(get_version()) >= parse_version('1.7'):
     from django.utils.module_loading import import_string
@@ -130,11 +127,11 @@ def denied(r):
     return render(r, 'django_saml2_auth/denied.html')
 
 
-def _create_new_user(username, email, firstname, lastname):
-    user = User.objects.create_user(username, email)
-    user.first_name = firstname
-    user.last_name = lastname
-    groups = [Group.objects.get(name=x) for x in settings.SAML2_AUTH.get('NEW_USER_PROFILE', {}).get('USER_GROUPS', [])]
+def _create_new_user(**user):
+    user = User.objects.create_user(**user)
+    groups = Group.objects.filter(
+        name__in=settings.SAML2_AUTH.get('NEW_USER_PROFILE', {}).get('USER_GROUPS', [])
+    )
     if parse_version(get_version()) >= parse_version('2.0'):
         user.groups.set(groups)
     else:
@@ -148,43 +145,76 @@ def _create_new_user(username, email, firstname, lastname):
 
 @csrf_exempt
 def acs(r):
+
+    transform_user = settings.SAML2_AUTH.get('TRANSFORM_USER')
+    if not transform_user:
+        raise ImproperlyConfigured(f'TRANSFORM_USER: {transform_user} must be defined.')
+    try:
+        if isinstance(transform_user, str):
+            transform_user = import_string(transform_user)
+    except ImportError:
+        raise ImproperlyConfigured(f'TRANSFORM_USER: {transform_user} could not be imported.')
+
+    if not callable(transform_user):
+        raise ImproperlyConfigured('TRANSFORM_USER is not a callable.')
+
+    USER_MODEL_LOOKUP_FIELD = settings.SAML2_AUTH.get('USER_MODEL_LOOKUP_FIELD', '')
+    if not USER_MODEL_LOOKUP_FIELD:
+        raise ImproperlyConfigured('USER_MODEL_LOOKUP_FIELD must be set.')
+
+
     saml_client = _get_saml_client(get_current_domain(r))
     resp = r.POST.get('SAMLResponse', None)
-    next_url = r.session.get('login_next_url', settings.SAML2_AUTH.get('DEFAULT_NEXT_URL', get_reverse('admin:index')))
+    next_url = r.session.get(
+        'login_next_url',
+        settings.SAML2_AUTH.get('DEFAULT_NEXT_URL', get_reverse('admin:index'))
+    )
 
     if not resp:
-        return HttpResponseRedirect(get_reverse([denied, 'denied', 'django_saml2_auth:denied']))
+        return HttpResponseRedirect(
+                get_reverse([denied, 'denied', 'django_saml2_auth:denied']))
 
     authn_response = saml_client.parse_authn_request_response(
         resp, entity.BINDING_HTTP_POST)
     if authn_response is None:
-        return HttpResponseRedirect(get_reverse([denied, 'denied', 'django_saml2_auth:denied']))
+        return HttpResponseRedirect(
+                get_reverse([denied, 'denied', 'django_saml2_auth:denied']))
 
     user_identity = authn_response.get_identity()
     if user_identity is None:
-        return HttpResponseRedirect(get_reverse([denied, 'denied', 'django_saml2_auth:denied']))
+        return HttpResponseRedirect(
+                get_reverse([denied, 'denied', 'django_saml2_auth:denied']))
 
-    user_email = user_identity[settings.SAML2_AUTH.get('ATTRIBUTES_MAP', {}).get('email', 'Email')][0]
-    user_name = user_identity[settings.SAML2_AUTH.get('ATTRIBUTES_MAP', {}).get('username', 'UserName')][0]
-    user_first_name = user_identity[settings.SAML2_AUTH.get('ATTRIBUTES_MAP', {}).get('first_name', 'FirstName')][0]
-    user_last_name = user_identity[settings.SAML2_AUTH.get('ATTRIBUTES_MAP', {}).get('last_name', 'LastName')][0]
+    user_transformed = transform_user(user_identity)
 
     target_user = None
     is_new_user = False
 
+    user_model_lookup_field_value = user_transformed.get(USER_MODEL_LOOKUP_FIELD)
+    if not user_model_lookup_field_value:
+        raise ImproperlyConfigured(
+            f'TRANSFORM_USER function did not return a '
+            'dict containing a {USER_MODEL_LOOKUP_FIELD} key.'
+        )
+
     try:
-        target_user = User.objects.get(username=user_name)
-        if settings.SAML2_AUTH.get('TRIGGER', {}).get('BEFORE_LOGIN', None):
-            import_string(settings.SAML2_AUTH['TRIGGER']['BEFORE_LOGIN'])(user_identity)
+        target_user = User.objects.get(**{USER_MODEL_LOOKUP_FIELD: user_model_lookup_field_value})
+        if settings.SAML2_AUTH.get('TRIGGER', {}).get('BEFORE_LOGIN'):
+            import_string(settings.SAML2_AUTH['TRIGGER']['BEFORE_LOGIN'])(user_transformed)
     except User.DoesNotExist:
-        new_user_should_be_created = settings.SAML2_AUTH.get('CREATE_USER', True)
-        if new_user_should_be_created: 
-            target_user = _create_new_user(user_name, user_email, user_first_name, user_last_name)
-            if settings.SAML2_AUTH.get('TRIGGER', {}).get('CREATE_USER', None):
-                import_string(settings.SAML2_AUTH['TRIGGER']['CREATE_USER'])(user_identity)
+        if settings.SAML2_AUTH.get('CREATE_USER', True):
+            if settings.SAML2_AUTH.get('TRIGGER', {}).get('BEFORE_CREATE'):
+                import_string(settings.SAML2_AUTH['TRIGGER']['CREATE_USER'])(
+                    user_transformed, user_identity)
+            target_user = _create_new_user(**user_transformed)
+            if settings.SAML2_AUTH.get('TRIGGER', {}).get('AFTER_CREATE'):
+                import_string(settings.SAML2_AUTH['TRIGGER']['AFTER_CREATE'])(
+                    target_user, user_transformed, user_identity
+                )
             is_new_user = True
         else:
-            return HttpResponseRedirect(get_reverse([denied, 'denied', 'django_saml2_auth:denied']))
+            return HttpResponseRedirect(get_reverse(
+                [denied, 'denied', 'django_saml2_auth:denied']))
 
     r.session.flush()
 
@@ -208,16 +238,15 @@ def acs(r):
         try:
             return render(r, 'django_saml2_auth/welcome.html', {'user': r.user})
         except TemplateDoesNotExist:
-            return HttpResponseRedirect(next_url)
-    else:
-        return HttpResponseRedirect(next_url)
+            pass
+    return HttpResponseRedirect(next_url)
 
 
 def signin(r):
     try:
         import urlparse as _urlparse
         from urllib import unquote
-    except:
+    except ImportError:
         import urllib.parse as _urlparse
         from urllib.parse import unquote
     next_url = r.GET.get('next', settings.SAML2_AUTH.get('DEFAULT_NEXT_URL', get_reverse('admin:index')))
@@ -229,7 +258,7 @@ def signin(r):
         next_url = r.GET.get('next', settings.SAML2_AUTH.get('DEFAULT_NEXT_URL', get_reverse('admin:index')))
 
     # Only permit signin requests where the next_url is a safe URL
-    if not is_safe_url(next_url, None):
+    if not is_safe_url(next_url, allowed_hosts=settings.ALLOWED_HOSTS, require_https=False):
         return HttpResponseRedirect(get_reverse([denied, 'denied', 'django_saml2_auth:denied']))
 
     r.session['login_next_url'] = next_url
